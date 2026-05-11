@@ -1,0 +1,258 @@
+/**
+ * FUNCIÓN PRINCIPAL
+ * Lee códigos de la hoja activa (columna A) y escribe resultados en dos hojas:
+ *   - "swift":  una sola columna con el último BIC terminado en XXX por código
+ *   - "swifts": todas las cadenas BIC válidas por código, en columnas
+ */
+function buscarSwiftsEnGmail() {
+  console.log('=== INICIANDO BÚSQUEDA ===');
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaActiva = ss.getActiveSheet();
+  const ultimaFila = hojaActiva.getLastRow();
+  
+  if (ultimaFila < 2) {
+    SpreadsheetApp.getUi().alert('No hay códigos en la columna A (desde A2) de la hoja activa.');
+    return;
+  }
+  
+  const codigos = hojaActiva.getRange(2, 1, ultimaFila - 1, 1).getValues();
+  
+  // Para cada código guardamos:
+  //   - todosLosSwifts: array con todas las coincidencias BIC
+  //   - ultimoXXX: el último que termina en XXX (o mensaje de estado)
+  const filas = [];
+  let maxColumnas = 0;
+  
+  for (let i = 0; i < codigos.length; i++) {
+    const codigo = String(codigos[i][0]).trim();
+    console.log('--- Fila ' + (i + 2) + ': "' + codigo + '" ---');
+    
+    if (!codigo) {
+      filas.push({ codigo: '', todos: [], ultimoXXX: '' });
+      continue;
+    }
+    
+    try {
+      const todos = buscarSwiftsPorCodigo(codigo);
+      
+      // Determinar el último terminado en XXX
+      let ultimoXXX = '';
+      if (todos.length === 1 && (todos[0] === 'NO ENCONTRADO' || todos[0] === 'SWIFT NO DETECTADO')) {
+        ultimoXXX = todos[0];
+      } else {
+        const conXXX = todos.filter(s => /XXX$/.test(s));
+        ultimoXXX = conXXX.length > 0 ? conXXX[conXXX.length - 1] : 'NO ENCONTRADO';
+      }
+      
+      console.log('>> Todos (' + todos.length + '): ' + JSON.stringify(todos));
+      console.log('>> Último XXX: ' + ultimoXXX);
+      
+      filas.push({ codigo: codigo, todos: todos, ultimoXXX: ultimoXXX });
+      
+      if (todos.length > maxColumnas) {
+        maxColumnas = todos.length;
+      }
+    } catch (e) {
+      console.log('ERROR: ' + e.message);
+      filas.push({ codigo: codigo, todos: ['ERROR: ' + e.message], ultimoXXX: 'ERROR: ' + e.message });
+      if (1 > maxColumnas) maxColumnas = 1;
+    }
+    
+    Utilities.sleep(200);
+  }
+  
+  if (maxColumnas === 0) maxColumnas = 1;
+  
+  // --- ESCRIBIR EN HOJA "swift" (único BIC con XXX) ---
+  escribirHojaSwift(ss, filas);
+  
+  // --- ESCRIBIR EN HOJA "swifts" (todas las coincidencias en columnas) ---
+  escribirHojaSwifts(ss, filas, maxColumnas);
+  
+  console.log('=== COMPLETADO ===');
+  SpreadsheetApp.getUi().alert(
+    'Búsqueda completada:\n' +
+    filas.length + ' códigos procesados\n' +
+    'Hoja "swift": último BIC con XXX por código\n' +
+    'Hoja "swifts": todas las coincidencias (máx ' + maxColumnas + ' columnas)'
+  );
+}
+
+/**
+ * Escribe la hoja "swift": columna A con el código, columna B con el último BIC XXX.
+ */
+function escribirHojaSwift(ss, filas) {
+  let hoja = ss.getSheetByName('swift');
+  if (!hoja) {
+    hoja = ss.insertSheet('swift');
+  } else {
+    hoja.clear();
+  }
+  
+  const datos = [['Código', 'SWIFT (último XXX)']];
+  for (const f of filas) {
+    datos.push([f.codigo, f.ultimoXXX]);
+  }
+  
+  hoja.getRange(1, 1, datos.length, 2).setValues(datos);
+  hoja.getRange(1, 1, 1, 2).setFontWeight('bold');
+  hoja.autoResizeColumns(1, 2);
+}
+
+/**
+ * Escribe la hoja "swifts": columna A con el código, columnas B, C, D... con
+ * todas las coincidencias BIC encontradas.
+ */
+function escribirHojaSwifts(ss, filas, maxColumnas) {
+  let hoja = ss.getSheetByName('swifts');
+  if (!hoja) {
+    hoja = ss.insertSheet('swifts');
+  } else {
+    hoja.clear();
+  }
+  
+  // Encabezados
+  const encabezados = ['Código'];
+  for (let i = 1; i <= maxColumnas; i++) {
+    encabezados.push('SWIFT ' + i);
+  }
+  
+  const datos = [encabezados];
+  
+  for (const f of filas) {
+    const fila = [f.codigo];
+    for (let i = 0; i < maxColumnas; i++) {
+      fila.push(f.todos[i] || '');
+    }
+    datos.push(fila);
+  }
+  
+  hoja.getRange(1, 1, datos.length, maxColumnas + 1).setValues(datos);
+  hoja.getRange(1, 1, 1, maxColumnas + 1).setFontWeight('bold');
+  hoja.autoResizeColumns(1, maxColumnas + 1);
+}
+
+/**
+ * Busca en Gmail el correo que contiene el código y devuelve TODAS las
+ * cadenas con formato BIC encontradas en el cuerpo.
+ */
+function buscarSwiftsPorCodigo(codigo) {
+  const query = 'tesoreriafx@kapital.com ' + codigo;
+  const hilos = GmailApp.search(query, 0, 10);
+  console.log('Hilos encontrados: ' + hilos.length);
+  
+  if (hilos.length === 0) {
+    return ['NO ENCONTRADO'];
+  }
+  
+  for (const hilo of hilos) {
+    const mensajes = hilo.getMessages();
+    
+    for (const mensaje of mensajes) {
+      const cuerpo = mensaje.getPlainBody();
+      
+      if (cuerpo.toUpperCase().indexOf(codigo.toUpperCase()) === -1) {
+        continue;
+      }
+      
+      console.log('Código encontrado en: "' + mensaje.getSubject() + '"');
+      
+      const bloque = aislarBloqueOperacion(codigo, cuerpo);
+      const swifts = extraerTodosLosSwifts(bloque);
+      
+      if (swifts.length > 0) {
+        return swifts;
+      }
+    }
+  }
+  
+  return ['SWIFT NO DETECTADO'];
+}
+
+/**
+ * Aísla el bloque de texto que corresponde SOLO a esta operación.
+ */
+function aislarBloqueOperacion(codigo, cuerpo) {
+  const codigoUpper = codigo.toUpperCase();
+  const cuerpoUpper = cuerpo.toUpperCase();
+  
+  const inicio = cuerpoUpper.indexOf(codigoUpper);
+  if (inicio === -1) return cuerpo;
+  
+  let prefijoSiguiente;
+  if (codigoUpper.startsWith('EPBC')) {
+    prefijoSiguiente = /ePBC\d+/gi;
+  } else if (codigoUpper.startsWith('EKES') || codigoUpper.startsWith('EKS')) {
+    prefijoSiguiente = /EKES\d+/gi;
+  } else if (codigoUpper.startsWith('VAM')) {
+    prefijoSiguiente = /VAM\d+/gi;
+  } else {
+    return cuerpo.substring(inicio);
+  }
+  
+  const desde = inicio + codigo.length;
+  const restoCuerpo = cuerpo.substring(desde);
+  
+  prefijoSiguiente.lastIndex = 0;
+  const match = prefijoSiguiente.exec(restoCuerpo);
+  
+  if (match) {
+    const fin = desde + match.index;
+    console.log('Bloque aislado: ' + (fin - inicio) + ' caracteres (hay más operaciones después)');
+    return cuerpo.substring(inicio, fin);
+  }
+  
+  console.log('Bloque aislado: desde el código hasta el final');
+  return cuerpo.substring(inicio);
+}
+
+/**
+ * Extrae TODAS las cadenas que cumplen el formato BIC en el texto.
+ * Formato: 6 letras + 2 alfanum (8 chars) ó 6 letras + 5 alfanum (11 chars).
+ * Usa lookbehind/lookahead para detectar cadenas pegadas a /, :, , etc.
+ */
+function extraerTodosLosSwifts(texto) {
+  const regex = /(?<![A-Z0-9])[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?(?![A-Z0-9])/g;
+  const todos = [];
+  let m;
+  
+  while ((m = regex.exec(texto)) !== null) {
+    todos.push(m[0]);
+  }
+  
+  console.log('    SWIFTs detectados (' + todos.length + '): ' + JSON.stringify(todos));
+  return todos;
+}
+
+/**
+ * Función de prueba con UN código
+ */
+function probarUnCodigo() {
+  const codigoPrueba = 'ePBC8149'; // ← CAMBIA por un código real tuyo
+  
+  console.log('Probando: ' + codigoPrueba);
+  const todos = buscarSwiftsPorCodigo(codigoPrueba);
+  const conXXX = todos.filter(s => /XXX$/.test(s));
+  const ultimoXXX = conXXX.length > 0 ? conXXX[conXXX.length - 1] : 'NO ENCONTRADO';
+  
+  console.log('Todos: ' + JSON.stringify(todos));
+  console.log('Último XXX: ' + ultimoXXX);
+  
+  SpreadsheetApp.getUi().alert(
+    'Código: ' + codigoPrueba + '\n' +
+    'Todos (' + todos.length + '): ' + todos.join(', ') + '\n' +
+    'Último XXX: ' + ultimoXXX
+  );
+}
+
+/**
+ * Menú
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🔍 Buscar SWIFT')
+    .addItem('Ejecutar búsqueda completa', 'buscarSwiftsEnGmail')
+    .addItem('Probar con un código', 'probarUnCodigo')
+    .addToUi();
+}
