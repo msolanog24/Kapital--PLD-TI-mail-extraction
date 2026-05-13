@@ -1,0 +1,293 @@
+// ============================================================
+//  SWIFT EXTRACTOR — BÚSQUEDA POR ABA (O942)
+//
+//  Uso:
+//   1. En la hoja activa, columna A desde A2: pega las entradas
+//      que quedaron como "NO ENCONTRADO" o "SWIFT NO DETECTADO"
+//      en la extracción anterior.
+//   2. Ejecuta buscarSwiftsPorABA() desde el menú.
+//
+//  Lógica:
+//   - Busca en Gmail el correo que contenga la entrada de la col A.
+//   - En ese correo localiza el bloque O942.
+//   - Extrae el ABA: segundo campo de la línea "SB," (tras la 1ª coma).
+//   - Usa ese ABA como token de búsqueda en Gmail para encontrar
+//     el SWIFT asociado al banco.
+//   - Escribe resultados en hojas "swift_aba" y "swifts_aba".
+// ============================================================
+
+
+// ──────────────────────────────────────────────────────────
+// FUNCIÓN PRINCIPAL
+// ──────────────────────────────────────────────────────────
+function buscarSwiftsPorABA() {
+  console.log('=== INICIANDO BÚSQUEDA POR ABA ===');
+
+  const ss         = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaActiva = ss.getActiveSheet();
+  const ultimaFila = hojaActiva.getLastRow();
+
+  if (ultimaFila < 2) {
+    SpreadsheetApp.getUi().alert('No hay entradas en la columna A (desde A2) de la hoja activa.');
+    return;
+  }
+
+  const entradas    = hojaActiva.getRange(2, 1, ultimaFila - 1, 1).getValues();
+  const filas       = [];
+  let   maxColumnas = 0;
+
+  for (let i = 0; i < entradas.length; i++) {
+    const entrada = String(entradas[i][0]).trim();
+    console.log('--- Fila ' + (i + 2) + ': "' + entrada + '" ---');
+
+    if (!entrada) {
+      filas.push({ entrada: '', aba: '', todos: [], ultimoXXX: '' });
+      continue;
+    }
+
+    try {
+      // 1. Buscar el correo que corresponde a esta entrada
+      const cuerpo = buscarCuerpoCorreo(entrada);
+
+      if (!cuerpo) {
+        console.log('  Correo no encontrado para esta entrada.');
+        filas.push({ entrada, aba: '', todos: ['CORREO NO ENCONTRADO'], ultimoXXX: 'CORREO NO ENCONTRADO' });
+        if (1 > maxColumnas) maxColumnas = 1;
+        continue;
+      }
+
+      // 2. Extraer ABA del bloque O942
+      const aba = extraerABAdeO942(cuerpo);
+      console.log('  ABA extraído: "' + aba + '"');
+
+      if (!aba) {
+        console.log('  No se encontró ABA en el bloque O942.');
+        filas.push({ entrada, aba: '', todos: ['ABA NO ENCONTRADO'], ultimoXXX: 'ABA NO ENCONTRADO' });
+        if (1 > maxColumnas) maxColumnas = 1;
+        continue;
+      }
+
+      // 3. Buscar SWIFT usando el ABA como token
+      const swifts = buscarSwiftsPorToken(aba);
+      console.log('  SWIFTs encontrados: ' + JSON.stringify(swifts));
+
+      let ultimoXXX = '';
+      if (swifts.length === 1 && swifts[0] === 'NO ENCONTRADO') {
+        ultimoXXX = 'NO ENCONTRADO';
+      } else {
+        const conXXX = swifts.filter(s => /XXX$/.test(s));
+        ultimoXXX = conXXX.length > 0 ? conXXX[conXXX.length - 1] : 'NO ENCONTRADO';
+      }
+
+      filas.push({ entrada, aba, todos: swifts, ultimoXXX });
+      if (swifts.length > maxColumnas) maxColumnas = swifts.length;
+
+    } catch (e) {
+      console.log('ERROR: ' + e.message);
+      filas.push({ entrada, aba: '', todos: ['ERROR: ' + e.message], ultimoXXX: 'ERROR: ' + e.message });
+      if (1 > maxColumnas) maxColumnas = 1;
+    }
+
+    Utilities.sleep(200);
+  }
+
+  if (maxColumnas === 0) maxColumnas = 1;
+
+  escribirHojaSwiftABA(ss, filas);
+  escribirHojaSwiftsABA(ss, filas, maxColumnas);
+
+  console.log('=== COMPLETADO ===');
+  SpreadsheetApp.getUi().alert(
+    'Búsqueda por ABA completada:\n' +
+    filas.length + ' entradas procesadas\n' +
+    'Hoja "swift_aba":  último BIC con XXX por entrada\n' +
+    'Hoja "swifts_aba": todas las coincidencias'
+  );
+}
+
+
+// ──────────────────────────────────────────────────────────
+// BUSCAR EL CUERPO DEL CORREO QUE CONTIENE LA ENTRADA
+// Usa los números largos o palabras de la entrada como query.
+// ──────────────────────────────────────────────────────────
+function buscarCuerpoCorreo(entrada) {
+  // Extraer número largo de la entrada (referencia, ej. 00115235269)
+  const mNum = entrada.match(/(?<!\d)(\d{8,})(?!\d)/);
+  const query = mNum
+    ? 'from:tesoreriafx@kapital.com "' + mNum[1] + '"'
+    : 'from:tesoreriafx@kapital.com "' + entrada.substring(0, 40) + '"';
+
+  console.log('  Query correo: ' + query);
+  const hilos = GmailApp.search(query, 0, 5);
+  if (hilos.length === 0) return null;
+
+  for (const hilo of hilos) {
+    for (const mensaje of hilo.getMessages()) {
+      const cuerpo = mensaje.getPlainBody();
+      const entradaUpper = entrada.toUpperCase();
+      const token = mNum ? mNum[1] : entrada.toUpperCase();
+      if (cuerpo.toUpperCase().indexOf(token) !== -1) {
+        console.log('  Correo encontrado: "' + mensaje.getSubject() + '"');
+        return cuerpo;
+      }
+    }
+  }
+
+  return null;
+}
+
+
+// ──────────────────────────────────────────────────────────
+// EXTRAER ABA DESDE EL BLOQUE O942
+// La línea empieza con "SB," y el ABA es el 2º campo (índice 1).
+// Ejemplo: SB,103003616,SB1,THE BANKERS BANK,...
+//                ↑ ABA
+// ──────────────────────────────────────────────────────────
+function extraerABAdeO942(cuerpo) {
+  const lineas = cuerpo.split(/\r?\n/);
+
+  for (const linea of lineas) {
+    const l = linea.trim();
+    if (/^SB,/i.test(l)) {
+      const partes = l.split(',');
+      if (partes.length >= 2) {
+        const aba = partes[1].trim();
+        // Validar que sea numérico (ABA típicamente 9 dígitos, pero puede variar)
+        if (/^\d{6,}$/.test(aba)) {
+          return aba;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+
+// ──────────────────────────────────────────────────────────
+// BUSCAR SWIFTS EN GMAIL USANDO EL ABA COMO TOKEN
+// Queries en cascada: con comillas y sin comillas.
+// ──────────────────────────────────────────────────────────
+function buscarSwiftsPorToken(aba) {
+  const queries = [
+    'from:tesoreriafx@kapital.com "' + aba + '"',
+    'from:tesoreriafx@kapital.com ' + aba
+  ];
+
+  for (const query of queries) {
+    console.log('    Query: ' + query);
+    const hilos = GmailApp.search(query, 0, 10);
+    console.log('    Hilos encontrados: ' + hilos.length);
+    if (hilos.length === 0) continue;
+
+    for (const hilo of hilos) {
+      for (const mensaje of hilo.getMessages()) {
+        const cuerpo = mensaje.getPlainBody();
+
+        if (cuerpo.indexOf(aba) === -1) continue;
+
+        console.log('    ABA confirmado en: "' + mensaje.getSubject() + '"');
+
+        const swifts = extraerTodosLosSwifts(cuerpo);
+        if (swifts.length > 0) return swifts;
+      }
+    }
+  }
+
+  return ['NO ENCONTRADO'];
+}
+
+
+// ──────────────────────────────────────────────────────────
+// EXTRACCIÓN DE TODOS LOS BIC/SWIFT EN UN TEXTO
+// ──────────────────────────────────────────────────────────
+function extraerTodosLosSwifts(texto) {
+  const regex = /(?<![A-Z0-9])[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?(?![A-Z0-9])/g;
+  const todos  = [];
+  let m;
+
+  while ((m = regex.exec(texto)) !== null) {
+    todos.push(m[0]);
+  }
+
+  console.log('    SWIFTs detectados (' + todos.length + '): ' + JSON.stringify(todos));
+  return todos;
+}
+
+
+// ──────────────────────────────────────────────────────────
+// ESCRITURA DE HOJAS
+// ──────────────────────────────────────────────────────────
+function escribirHojaSwiftABA(ss, filas) {
+  let hoja = ss.getSheetByName('swift_aba');
+  if (!hoja) hoja = ss.insertSheet('swift_aba');
+  else hoja.clear();
+
+  const datos = [['Entrada', 'ABA extraído', 'SWIFT (último XXX)']];
+  for (const f of filas) datos.push([f.entrada, f.aba || '', f.ultimoXXX]);
+
+  hoja.getRange(1, 1, datos.length, 3).setValues(datos);
+  hoja.getRange(1, 1, 1, 3).setFontWeight('bold');
+  hoja.autoResizeColumns(1, 3);
+}
+
+function escribirHojaSwiftsABA(ss, filas, maxColumnas) {
+  let hoja = ss.getSheetByName('swifts_aba');
+  if (!hoja) hoja = ss.insertSheet('swifts_aba');
+  else hoja.clear();
+
+  const encabezados = ['Entrada', 'ABA extraído'];
+  for (let i = 1; i <= maxColumnas; i++) encabezados.push('SWIFT ' + i);
+
+  const datos = [encabezados];
+  for (const f of filas) {
+    const fila = [f.entrada, f.aba || ''];
+    for (let i = 0; i < maxColumnas; i++) fila.push(f.todos[i] || '');
+    datos.push(fila);
+  }
+
+  const totalCols = maxColumnas + 2;
+  hoja.getRange(1, 1, datos.length, totalCols).setValues(datos);
+  hoja.getRange(1, 1, 1, totalCols).setFontWeight('bold');
+  hoja.autoResizeColumns(1, totalCols);
+}
+
+
+// ──────────────────────────────────────────────────────────
+// PRUEBA DE UNA SOLA ENTRADA
+// ──────────────────────────────────────────────────────────
+function probarUnaEntradaABA() {
+  const entradaPrueba = 'REF 00115235269 ABDOL ALIABADI'; // ← CAMBIA
+
+  console.log('Probando: ' + entradaPrueba);
+
+  const cuerpo = buscarCuerpoCorreo(entradaPrueba);
+  if (!cuerpo) {
+    SpreadsheetApp.getUi().alert('Correo no encontrado para: ' + entradaPrueba);
+    return;
+  }
+
+  const aba = extraerABAdeO942(cuerpo);
+  console.log('ABA: ' + aba);
+
+  const swifts = aba ? buscarSwiftsPorToken(aba) : ['ABA NO ENCONTRADO'];
+  console.log('SWIFTs: ' + JSON.stringify(swifts));
+
+  SpreadsheetApp.getUi().alert(
+    'Entrada: ' + entradaPrueba + '\n' +
+    'ABA: ' + (aba || 'no encontrado') + '\n' +
+    'SWIFTs: ' + swifts.join(', ')
+  );
+}
+
+
+// ──────────────────────────────────────────────────────────
+// MENÚ
+// ──────────────────────────────────────────────────────────
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🔍 Buscar SWIFT por ABA')
+    .addItem('Ejecutar búsqueda por ABA', 'buscarSwiftsPorABA')
+    .addItem('Probar con una entrada',    'probarUnaEntradaABA')
+    .addToUi();
+}
