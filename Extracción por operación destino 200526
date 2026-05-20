@@ -1,0 +1,428 @@
+// ============================================================
+//  SWIFT + ABA EXTRACTOR
+//
+//  FIX en esta versión:
+//   - extraerTodosLosSwifts ahora PRIORIZA el campo "To:" cuando
+//     existe (formato 1: cabecera Business Application Header).
+//     Si no hay "To:", cae al regex general como antes.
+// ============================================================
+
+// ──────────────────────────────────────────────────────────
+// FUNCIÓN PRINCIPAL
+// ──────────────────────────────────────────────────────────
+function buscarSwiftsEnGmail() {
+  console.log('=== INICIANDO BÚSQUEDA ===');
+
+  const ss         = SpreadsheetApp.getActiveSpreadsheet();
+  const hojaActiva = ss.getActiveSheet();
+  const ultimaFila = hojaActiva.getLastRow();
+
+  if (ultimaFila < 2) {
+    SpreadsheetApp.getUi().alert('No hay entradas en la columna A (desde A2) de la hoja activa.');
+    return;
+  }
+
+  const entradas    = hojaActiva.getRange(2, 1, ultimaFila - 1, 1).getValues();
+  const filas       = [];
+  let   maxSwifts   = 0;
+  let   maxAbas     = 0;
+
+  for (let i = 0; i < entradas.length; i++) {
+    const entrada = String(entradas[i][0]).trim();
+    console.log('--- Fila ' + (i + 2) + ': "' + entrada + '" ---');
+
+    if (!entrada) {
+      filas.push({ entrada: '', swifts: [], abas: [], ultimoXXX: '', ultimoABA: '', tokenUsado: '' });
+      continue;
+    }
+
+    try {
+      const tokens = extraerTokens(entrada);
+      console.log('  Tokens: ' + JSON.stringify(tokens));
+
+      if (tokens.length === 0) {
+        filas.push({
+          entrada, swifts: ['SIN TOKENS'], abas: [],
+          ultimoXXX: 'SIN TOKENS', ultimoABA: '', tokenUsado: ''
+        });
+        continue;
+      }
+
+      const { swifts, abas, tokenUsado } = buscarPorTokens(tokens);
+
+      let ultimoXXX = '';
+      if (swifts.length === 1 && (swifts[0] === 'NO ENCONTRADO' || swifts[0] === 'SWIFT NO DETECTADO')) {
+        ultimoXXX = swifts[0];
+      } else {
+        const conXXX = swifts.filter(s => /XXX$/.test(s));
+        ultimoXXX = conXXX.length > 0 ? conXXX[conXXX.length - 1] : 'NO ENCONTRADO';
+      }
+
+      const ultimoABA = abas.length > 0 ? abas[abas.length - 1] : '';
+
+      console.log('  Token que pegó: "' + tokenUsado + '"');
+      console.log('  SWIFTs: ' + JSON.stringify(swifts));
+      console.log('  ABAs:   ' + JSON.stringify(abas));
+
+      filas.push({ entrada, swifts, abas, ultimoXXX, ultimoABA, tokenUsado });
+      if (swifts.length > maxSwifts) maxSwifts = swifts.length;
+      if (abas.length   > maxAbas)   maxAbas   = abas.length;
+
+    } catch (e) {
+      console.log('ERROR: ' + e.message);
+      filas.push({
+        entrada, swifts: ['ERROR: ' + e.message], abas: [],
+        ultimoXXX: 'ERROR: ' + e.message, ultimoABA: '', tokenUsado: ''
+      });
+      if (1 > maxSwifts) maxSwifts = 1;
+    }
+
+    Utilities.sleep(200);
+  }
+
+  if (maxSwifts === 0) maxSwifts = 1;
+  if (maxAbas   === 0) maxAbas   = 1;
+
+  escribirHojaSwift(ss, filas);
+  escribirHojaSwifts(ss, filas, maxSwifts, maxAbas);
+
+  console.log('=== COMPLETADO ===');
+  SpreadsheetApp.getUi().alert(
+    'Búsqueda completada:\n' +
+    filas.length + ' entradas procesadas\n' +
+    'Hoja "swift":  último SWIFT-XXX y último ABA por entrada\n' +
+    'Hoja "swifts": todas las coincidencias por entrada'
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// EXTRACCIÓN DE TOKENS
+// ──────────────────────────────────────────────────────────
+function extraerTokens(entrada) {
+  const tokens = [];
+
+  const regexNumeros = /(?<!\d)(\d{8,})(?!\d)/g;
+  let m;
+  while ((m = regexNumeros.exec(entrada)) !== null) {
+    tokens.push(m[1]);
+  }
+
+  const palabrasRuido = new Set([
+    'REF','OBI','BBI','URI','FEES','DEDUCTED','SALIDA','DEL',
+    'PAGO','DE','FACTURA','OPERATING','EXPENSES','N',
+    'ASOCIACION','CONDOMINOS','L','S','M','A',
+    'DE','LA','EL','LOS','LAS','Y','O','EN','CON'
+  ]);
+
+  const sinNumeros = entrada.replace(/\d+/g, ' ').replace(/[^\wáéíóúñÁÉÍÓÚÑ\s]/g, ' ');
+  const palabras   = sinNumeros.split(/\s+/)
+    .map(p => p.trim().toUpperCase())
+    .filter(p => p.length >= 3 && !palabrasRuido.has(p));
+
+  if (palabras.length > 0) {
+    const nombreCompleto = palabras.join(' ');
+    if (nombreCompleto.length >= 6) tokens.push(nombreCompleto);
+
+    for (const p of palabras) {
+      if (p.length >= 5 && !tokens.includes(p)) tokens.push(p);
+    }
+  }
+
+  return tokens;
+}
+
+// ──────────────────────────────────────────────────────────
+// BÚSQUEDA POR TOKENS EN CASCADA
+// ──────────────────────────────────────────────────────────
+function buscarPorTokens(tokens) {
+  for (const token of tokens) {
+    console.log('  Probando token: "' + token + '"');
+    const resultado = buscarSwiftsYAbasEnCorreoConToken(token);
+
+    const tieneSwifts = resultado.swifts.length > 0 &&
+                        resultado.swifts[0] !== 'NO ENCONTRADO' &&
+                        resultado.swifts[0] !== 'SWIFT NO DETECTADO';
+    const tieneAbas   = resultado.abas.length > 0;
+
+    if (tieneSwifts || tieneAbas) {
+      return { swifts: resultado.swifts, abas: resultado.abas, tokenUsado: token };
+    }
+  }
+
+  return { swifts: ['NO ENCONTRADO'], abas: [], tokenUsado: tokens[0] || '' };
+}
+
+// ──────────────────────────────────────────────────────────
+// BÚSQUEDA EN GMAIL
+// ──────────────────────────────────────────────────────────
+function buscarSwiftsYAbasEnCorreoConToken(token) {
+  const esNumero = /^\d+$/.test(token);
+  const queries  = [];
+
+  if (esNumero) {
+    queries.push('from:tesoreriafx@kapital.com "' + token + '"');
+    queries.push('from:tesoreriafx@kapital.com '  + token);
+  } else {
+    queries.push('from:tesoreriafx@kapital.com "' + token + '"');
+    const claves = token.split(' ').filter(p => p.length >= 6);
+    if (claves.length > 0) {
+      queries.push('from:tesoreriafx@kapital.com ' + claves.join(' '));
+    }
+  }
+
+  for (const query of queries) {
+    console.log('    Query: ' + query);
+    const hilos = GmailApp.search(query, 0, 10);
+    console.log('    Hilos: ' + hilos.length);
+    if (hilos.length === 0) continue;
+
+    for (const hilo of hilos) {
+      for (const mensaje of hilo.getMessages()) {
+        const cuerpo = mensaje.getPlainBody();
+
+        if (!tokenPresenteEnCuerpo(token, cuerpo)) continue;
+
+        console.log('    Token confirmado en: "' + mensaje.getSubject() + '"');
+
+        const bloque = aislarBloqueOperacion(token, cuerpo);
+        const swifts = extraerTodosLosSwifts(bloque);
+        const abas   = extraerTodosLosAbas(bloque);
+
+        if (swifts.length > 0 || abas.length > 0) {
+          return { swifts, abas };
+        }
+      }
+    }
+  }
+
+  return { swifts: [esNumero ? 'NO ENCONTRADO' : 'SWIFT NO DETECTADO'], abas: [] };
+}
+
+// ──────────────────────────────────────────────────────────
+// VERIFICACIÓN FLEXIBLE DEL TOKEN
+// ──────────────────────────────────────────────────────────
+function tokenPresenteEnCuerpo(token, cuerpo) {
+  const cuerpoUpper = cuerpo.toUpperCase();
+  const tokenUpper  = token.toUpperCase();
+
+  if (cuerpoUpper.indexOf(tokenUpper) !== -1) return true;
+
+  const tokenSinEsp  = tokenUpper.replace(/\s+/g, '');
+  const cuerpoSinEsp = cuerpoUpper.replace(/\s+/g, '');
+  if (tokenSinEsp.length >= 8 && cuerpoSinEsp.indexOf(tokenSinEsp) !== -1) return true;
+
+  const palabras = tokenUpper.split(/\s+/).filter(p => p.length >= 6);
+  if (palabras.length >= 2 && palabras.every(p => cuerpoUpper.indexOf(p) !== -1)) return true;
+
+  return false;
+}
+
+// ──────────────────────────────────────────────────────────
+// AÍSLA EL BLOQUE DE LA OPERACIÓN
+// ──────────────────────────────────────────────────────────
+function aislarBloqueOperacion(token, cuerpo) {
+  const tokenUpper  = token.toUpperCase();
+  const cuerpoUpper = cuerpo.toUpperCase();
+
+  let inicio = cuerpoUpper.indexOf(tokenUpper);
+
+  if (inicio === -1 && !/^\d+$/.test(token)) {
+    const tokenSinEsp  = tokenUpper.replace(/\s+/g, '');
+    const cuerpoSinEsp = cuerpoUpper.replace(/\s+/g, '');
+    const idxSinEsp    = cuerpoSinEsp.indexOf(tokenSinEsp);
+
+    if (idxSinEsp !== -1) {
+      let cuenta = 0;
+      for (let i = 0; i < cuerpo.length; i++) {
+        if (cuerpo[i] !== ' ') {
+          if (cuenta === idxSinEsp) { inicio = i; break; }
+          cuenta++;
+        }
+      }
+    }
+  }
+
+  if (inicio === -1) {
+    console.log('    Token no localizado; usando cuerpo completo');
+    return cuerpo;
+  }
+
+  const desde       = inicio + token.length;
+  const restoCuerpo = cuerpo.substring(desde);
+
+  const regexSiguiente = /\b(ePBC\d+|eLCA\d+|EKES\d+|VAM\d+|REF\s+\d{8,})\b/gi;
+  regexSiguiente.lastIndex = 0;
+  const matchSig = regexSiguiente.exec(restoCuerpo);
+
+  let fin;
+  if (matchSig) {
+    fin = desde + matchSig.index;
+    console.log('    Bloque aislado: ' + (fin - inicio) + ' chars (siguiente operación: "' + matchSig[0] + '")');
+  } else {
+    fin = cuerpo.length;
+    console.log('    Bloque aislado: ' + (fin - inicio) + ' chars (hasta el final del correo)');
+  }
+
+  let bloque = cuerpo.substring(inicio, fin);
+
+  const lineasPost   = cuerpo.substring(fin).split('\n');
+  const continuacion = [];
+  for (const linea of lineasPost) {
+    if (/^\s*\/\//.test(linea)) continuacion.push(linea);
+    else break;
+  }
+  if (continuacion.length > 0) {
+    bloque += '\n' + continuacion.join('\n');
+    console.log('    Añadidas ' + continuacion.length + ' línea(s) de continuación //');
+  }
+
+  return bloque;
+}
+
+// ──────────────────────────────────────────────────────────
+// EXTRACCIÓN DE SWIFT/BIC
+//
+// [FIX] Prioridad de búsqueda:
+//   1. Si el bloque tiene una línea "To: <BIC>", devuelve SOLO ese BIC.
+//      (Formato 1: cabecera Business Application Header)
+//   2. Si no hay "To:", cae al regex general que captura todos los BIC
+//      del bloque (como antes).
+//
+//   Esto evita que en el formato 1 se devuelva el BIC del campo "From:"
+//   en lugar del verdadero destinatario en "To:".
+// ──────────────────────────────────────────────────────────
+function extraerTodosLosSwifts(texto) {
+  // 1) Buscar específicamente el campo "To: <BIC>"
+  //    Permite cualquier cantidad de espacios después de los dos puntos.
+  const regexTo = /\bTo\s*:\s*((?:[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?))(?![A-Z0-9])/i;
+  const matchTo = texto.match(regexTo);
+
+  if (matchTo && matchTo[1]) {
+    console.log('    SWIFT detectado en "To:": ' + matchTo[1]);
+    return [matchTo[1].toUpperCase()];
+  }
+
+  // 2) Fallback: regex general — captura todos los BIC del bloque
+  const regex = /(?<![A-Z0-9])[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?(?![A-Z0-9])/g;
+  const todos = [];
+  let m;
+  while ((m = regex.exec(texto)) !== null) {
+    todos.push(m[0]);
+  }
+  console.log('    SWIFTs detectados (fallback general, ' + todos.length + '): ' + JSON.stringify(todos));
+  return todos;
+}
+
+// ──────────────────────────────────────────────────────────
+// EXTRACCIÓN DE ABAs DEL BLOQUE -- O942 --
+// ──────────────────────────────────────────────────────────
+function extraerTodosLosAbas(bloque) {
+  const abas = [];
+  const bloqueNormalizado = bloque.replace(/\r\n/g, '\n');
+
+  const regexInicio = /--\s*[O0]942\s*--/gi;
+  let matchInicio;
+
+  while ((matchInicio = regexInicio.exec(bloqueNormalizado)) !== null) {
+    const desde     = matchInicio.index + matchInicio[0].length;
+    const restoTxt  = bloqueNormalizado.substring(desde);
+
+    const regexFin    = /--\s*[A-Z0-9]+\s*--/i;
+    const matchFin    = restoTxt.match(regexFin);
+    const bloqueO942  = matchFin ? restoTxt.substring(0, matchFin.index) : restoTxt;
+
+    console.log('    Sección O942 (' + bloqueO942.length + ' chars): ' +
+                bloqueO942.substring(0, 80).replace(/\n/g, '|'));
+
+    const regexABA = /SB\s*,\s*(\d{9})\s*,/i;
+    const matchABA = bloqueO942.match(regexABA);
+
+    if (matchABA) {
+      console.log('    ABA encontrado: ' + matchABA[1]);
+      abas.push(matchABA[1]);
+    } else {
+      console.log('    (no se encontró patrón SB,XXXXXXXXX, en este O942)');
+    }
+  }
+
+  console.log('    ABAs totales (' + abas.length + '): ' + JSON.stringify(abas));
+  return abas;
+}
+
+// ──────────────────────────────────────────────────────────
+// ESCRITURA DE HOJA "swift"
+// ──────────────────────────────────────────────────────────
+function escribirHojaSwift(ss, filas) {
+  let hoja = ss.getSheetByName('swift');
+  if (!hoja) hoja = ss.insertSheet('swift');
+  else hoja.clear();
+
+  const datos = [['Entrada', 'Token usado', 'SWIFT (último XXX)', 'ABA']];
+  for (const f of filas) {
+    datos.push([f.entrada, f.tokenUsado || '', f.ultimoXXX, f.ultimoABA || '']);
+  }
+
+  hoja.getRange(1, 1, datos.length, 4).setValues(datos);
+  hoja.getRange(1, 1, 1, 4).setFontWeight('bold');
+  hoja.autoResizeColumns(1, 4);
+}
+
+// ──────────────────────────────────────────────────────────
+// ESCRITURA DE HOJA "swifts"
+// ──────────────────────────────────────────────────────────
+function escribirHojaSwifts(ss, filas, maxSwifts, maxAbas) {
+  let hoja = ss.getSheetByName('swifts');
+  if (!hoja) hoja = ss.insertSheet('swifts');
+  else hoja.clear();
+
+  const encabezados = ['Entrada', 'Token usado'];
+  for (let i = 1; i <= maxSwifts; i++) encabezados.push('SWIFT ' + i);
+  for (let i = 1; i <= maxAbas;   i++) encabezados.push('ABA '   + i);
+
+  const datos = [encabezados];
+  for (const f of filas) {
+    const fila = [f.entrada, f.tokenUsado || ''];
+    for (let i = 0; i < maxSwifts; i++) fila.push(f.swifts[i] || '');
+    for (let i = 0; i < maxAbas;   i++) fila.push(f.abas[i]   || '');
+    datos.push(fila);
+  }
+
+  const totalCols = 2 + maxSwifts + maxAbas;
+  hoja.getRange(1, 1, datos.length, totalCols).setValues(datos);
+  hoja.getRange(1, 1, 1, totalCols).setFontWeight('bold');
+  hoja.autoResizeColumns(1, totalCols);
+}
+
+// ──────────────────────────────────────────────────────────
+// PRUEBA DE UNA SOLA ENTRADA
+// ──────────────────────────────────────────────────────────
+function probarUnaEntrada() {
+  const entradaPrueba = 'ePBC8469'; // ← CAMBIA
+
+  console.log('Probando: ' + entradaPrueba);
+  const tokens = extraerTokens(entradaPrueba);
+  console.log('Tokens: ' + JSON.stringify(tokens));
+
+  const { swifts, abas, tokenUsado } = buscarPorTokens(tokens);
+  console.log('Token usado: ' + tokenUsado);
+  console.log('SWIFTs: ' + JSON.stringify(swifts));
+  console.log('ABAs:   ' + JSON.stringify(abas));
+
+  SpreadsheetApp.getUi().alert(
+    'Entrada: ' + entradaPrueba + '\n' +
+    'Token que pegó: ' + tokenUsado + '\n' +
+    'SWIFTs: ' + swifts.join(', ') + '\n' +
+    'ABAs: '   + (abas.length ? abas.join(', ') : '(ninguno)')
+  );
+}
+
+// ──────────────────────────────────────────────────────────
+// MENÚ
+// ──────────────────────────────────────────────────────────
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('🔍 Buscar SWIFT')
+    .addItem('Ejecutar búsqueda completa', 'buscarSwiftsEnGmail')
+    .addItem('Probar con una entrada',     'probarUnaEntrada')
+    .addToUi();
+}
